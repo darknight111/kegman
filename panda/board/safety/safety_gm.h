@@ -24,20 +24,31 @@ const int GM_DRIVER_TORQUE_FACTOR = 4;
 const int GM_MAX_GAS = 3072;
 const int GM_MAX_REGEN = 1404;
 const int GM_MAX_BRAKE = 350;
-const CanMsg GM_TX_MSGS[] = {{384, 0, 4}, {1033, 0, 7}, {1034, 0, 7}, {715, 0, 8}, {880, 0, 6},  // pt bus
-                             {161, 1, 7}, {774, 1, 8}, {776, 1, 7}, {784, 1, 2},   // obs bus
-                             {789, 2, 5},  // ch bus
-                             {0x104c006c, 3, 3}, {0x10400060, 3, 5}};  // gmlan
+const int GM_GAS_INTERCEPTOR_THRESHOLD = 458;  // (610 + 306.25) / 2ratio between offset and gain from dbc file
+const AddrBus GM_TX_MSGS[] = {{384, 0}, {1033, 0}, {1034, 0}, {715, 0}, {880, 0}, {512, 0},  // pt bus
+                              {161, 1}, {774, 1}, {776, 1}, {784, 1},   // obs bus
+                              {789, 2},  // ch bus
+                              {0x104c006c, 3}, {0x10400060, 3}};  // gmlan
 
 // TODO: do checksum and counter checks. Add correct timestep, 0.1s for now.
 AddrCheckStruct gm_rx_checks[] = {
-  {.msg = {{388, 0, 8, .expected_timestep = 100000U}}},
-  {.msg = {{842, 0, 5, .expected_timestep = 100000U}}},
-  {.msg = {{481, 0, 7, .expected_timestep = 100000U}}},
-  {.msg = {{241, 0, 6, .expected_timestep = 100000U}}},
-  {.msg = {{417, 0, 7, .expected_timestep = 100000U}}},
+  {.addr = {388}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {842}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {481}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {241}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {417}, .bus = 0, .expected_timestep = 100000U},
 };
 const int GM_RX_CHECK_LEN = sizeof(gm_rx_checks) / sizeof(gm_rx_checks[0]);
+
+bool gm_relay_open = false;
+int gm_camera_bus = -1;
+int gm_brake_prev = 0;
+int gm_gas_prev = 0;
+bool gm_moving = false;
+int gm_rt_torque_last = 0;
+int gm_desired_torque_last = 0;
+uint32_t gm_ts_last = 0;
+struct sample_t gm_torque_driver;         // last few driver torques measured
 
 static void gm_init_lkas_pump(void);
 
@@ -80,25 +91,66 @@ static void gm_set_op_lkas(CAN_FIFOMailBox_TypeDef *to_send) {
   gm_lkas_buffer.op_ts = TIM2->CNT;
 }
 
+static void gm_detect_cam(void) {
+  if (gm_camera_bus != -1) return;
+  if (board_has_relay()) {
+    gm_camera_bus = 2;
+  }
+  else {
+    gm_camera_bus = 1;
+  }
+}
+
 static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
   bool valid = addr_safety_check(to_push, gm_rx_checks, GM_RX_CHECK_LEN,
                                  NULL, NULL, NULL);
 
-  if (valid && (GET_BUS(to_push) == 0)) {
+  if (valid) {
+    gm_detect_cam();
+    int bus = GET_BUS(to_push);
     int addr = GET_ADDR(to_push);
+    
+    if (board_has_relay() && !gm_relay_open) {
+      if (addr == 384) {
+        int rolling_counter = GET_BYTE(to_push, 0) >> 4;
+        if (rolling_counter == 0) {
+          gm_lkas_buffer.rolling_counter = 3;
+        }
+        else {
+          gm_lkas_buffer.rolling_counter = rolling_counter - 1;
+        }
+        set_intercept_relay(true);
+        heartbeat_counter = 0U;
+        gm_relay_open = true;
+      }
+      return 0;
+    }
+
+    // exit controls on rising edge of gas press if interceptor (0x201 w/ len = 6)
+    if (addr == 0x201) {
+      gas_interceptor_detected = 1;
+      int gas_interceptor = GET_INTERCEPTOR(to_push);
+      if ((gas_interceptor > GM_GAS_INTERCEPTOR_THRESHOLD) &&
+          (gas_interceptor_prev <= GM_GAS_INTERCEPTOR_THRESHOLD)) {
+        //controls_allowed = 0; //TODO: gas press causes controls failed. It's better if gas doesn't cancel anyway...
+      }
+      gas_interceptor_prev = gas_interceptor;
+    }
+
+
 
     if (addr == 388) {
       int torque_driver_new = ((GET_BYTE(to_push, 6) & 0x7) << 8) | GET_BYTE(to_push, 7);
       torque_driver_new = to_signed(torque_driver_new, 11);
       // update array of samples
-      update_sample(&torque_driver, torque_driver_new);
+      update_sample(&gm_torque_driver, torque_driver_new);
     }
 
     // sample speed, really only care if car is moving or not
     // rear left wheel speed
     if (addr == 842) {
-      vehicle_moving = GET_BYTE(to_push, 0) | GET_BYTE(to_push, 1);
+      gm_moving = GET_BYTE(to_push, 0) | GET_BYTE(to_push, 1);
     }
 
     // ACC steering wheel buttons
@@ -107,11 +159,12 @@ static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
       switch (button) {
         case 2:  // resume
         case 3:  // set
-        case 5:  // main on
           controls_allowed = 1;
           break;
         case 6:  // cancel
-          controls_allowed = 1;
+          if (!gas_interceptor_detected) {
+            controls_allowed = 0;
+          }
           break;
         default:
           break;  // any other button is irrelevant
@@ -120,20 +173,34 @@ static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
     // speed > 0
     if (addr == 241) {
+      int brake = GET_BYTE(to_push, 1);
       // Brake pedal's potentiometer returns near-zero reading
       // even when pedal is not pressed
-      brake_pressed = GET_BYTE(to_push, 1) >= 10;
+      if (brake < 10) {
+        brake = 0;
+      }
+      if (brake && (!gm_brake_prev || gm_moving)) {
+         controls_allowed = 0;
+      }
+      gm_brake_prev = brake;
     }
 
-    if (addr == 417) {
-      gas_pressed = GET_BYTE(to_push, 6) != 0;
+    // exit controls on rising edge of gas press
+    if (!gas_interceptor_detected) {
+      if (addr == 417) {
+        int gas = GET_BYTE(to_push, 6);
+        if (gas && !gm_gas_prev) {
+          controls_allowed = 0;
+        }
+        gm_gas_prev = gas;
+      }
     }
 
     // exit controls on regen paddle
     if (addr == 189) {
       bool regen = GET_BYTE(to_push, 0) & 0x20;
       if (regen) {
-        controls_allowed = 1;
+        controls_allowed = 0;
       }
     }
 
@@ -141,7 +208,9 @@ static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     // on powertrain bus.
     // 384 = ASCMLKASteeringCmd
     // 715 = ASCMGasRegenCmd
-    generic_rx_checks(((addr == 384) || (addr == 715)));
+    if ((safety_mode_cnt > RELAY_TRNS_TIMEOUT) && (bus == 0) && ((addr == 384) || (addr == 715))) {
+      relay_malfunction = true;
+    }
   }
   return valid;
 }
@@ -153,11 +222,14 @@ static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 //     block all commands that produce actuation
 
 static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
+  if (board_has_relay() && !gm_relay_open) return 0; //for now, when relay is closed we don't want to do anything
 
   int tx = 1;
   int addr = GET_ADDR(to_send);
+  int bus = GET_BUS(to_send);
+  gm_detect_cam();
 
-  if (!msg_allowed(to_send, GM_TX_MSGS, sizeof(GM_TX_MSGS)/sizeof(GM_TX_MSGS[0]))) {
+  if (!msg_allowed(addr, bus, GM_TX_MSGS, sizeof(GM_TX_MSGS)/sizeof(GM_TX_MSGS[0]))) {
     tx = 0;
   }
 
@@ -167,8 +239,32 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
   // disallow actuator commands if gas or brake (with vehicle moving) are pressed
   // and the the latching controls_allowed flag is True
-  int pedal_pressed = brake_pressed_prev && vehicle_moving;
-  bool current_controls_allowed = controls_allowed && !pedal_pressed;
+   int pedal_pressed = gm_gas_prev || (gas_interceptor_prev > GM_GAS_INTERCEPTOR_THRESHOLD) ||
+                       (gm_brake_prev && gm_moving);
+
+  if (gas_interceptor_detected) {
+    //When using pedal, do not disable when gas pressed
+    pedal_pressed = (gm_brake_prev && gm_moving);
+  }
+
+  bool current_controls_allowed = controls_allowed && !(pedal_pressed);
+
+
+
+  // GAS: Interceptor safety check
+  if (addr == 0x200) {
+    if (!current_controls_allowed) {
+      if (GET_BYTE(to_send, 0) || GET_BYTE(to_send, 1)) {
+        puts("gas safety check failed");
+        tx = 0;
+      }
+    }
+  }
+
+  // // disallow actuator commands if gas or brake (with vehicle moving) are pressed
+  // // and the the latching controls_allowed flag is True
+  // int pedal_pressed = gm_gas_prev || (gm_brake_prev && gm_moving);
+  // bool current_controls_allowed = controls_allowed && !pedal_pressed;
 
   // BRAKE: safety check
   if (addr == 789) {
@@ -203,21 +299,21 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
       violation |= max_limit_check(desired_torque, GM_MAX_STEER, -GM_MAX_STEER);
 
       // *** torque rate limit check ***
-      violation |= driver_limit_check(desired_torque, desired_torque_last, &torque_driver,
+      violation |= driver_limit_check(desired_torque, gm_desired_torque_last, &gm_torque_driver,
         GM_MAX_STEER, GM_MAX_RATE_UP, GM_MAX_RATE_DOWN,
         GM_DRIVER_TORQUE_ALLOWANCE, GM_DRIVER_TORQUE_FACTOR);
 
       // used next time
-      desired_torque_last = desired_torque;
+      gm_desired_torque_last = desired_torque;
 
       // *** torque real time rate limit check ***
-      violation |= rt_rate_limit_check(desired_torque, rt_torque_last, GM_MAX_RT_DELTA);
+      violation |= rt_rate_limit_check(desired_torque, gm_rt_torque_last, GM_MAX_RT_DELTA);
 
       // every RT_INTERVAL set the new limits
-      uint32_t ts_elapsed = get_ts_elapsed(ts, ts_last);
+      uint32_t ts_elapsed = get_ts_elapsed(ts, gm_ts_last);
       if (ts_elapsed > GM_RT_INTERVAL) {
-        rt_torque_last = desired_torque;
-        ts_last = ts;
+        gm_rt_torque_last = desired_torque;
+        gm_ts_last = ts;
       }
     }
 
@@ -228,9 +324,10 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
     // reset to 0 if either controls is not allowed or there's a violation
     if (violation || !current_controls_allowed) {
-      desired_torque_last = 0;
-      rt_torque_last = 0;
-      ts_last = ts;
+      //puts("no steer reset to zero");
+      gm_desired_torque_last = 0;
+      gm_rt_torque_last = 0;
+      gm_ts_last = ts;
     }
 
     if (violation) {
@@ -262,14 +359,16 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 }
 
 static int gm_fwd_hook(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
+  if (board_has_relay() && !gm_relay_open) return 0; //for now, when relay is closed we don't want to do anything
+  gm_detect_cam();
   int bus_fwd = -1;
   if (bus_num == 0) {
     if (gm_ffc_detected) {
       //only perform forwarding if we have seen LKAS messages on CAN2
-      bus_fwd = 1;  // Camera is on CAN2
+      bus_fwd = gm_camera_bus;  // Camera is on CAN2
     }
   }
-  if (bus_num == 1) {
+  if (bus_num == gm_camera_bus) {
     int addr = GET_ADDR(to_fwd);
     if (addr != 384) {
       //only perform forwarding if we have seen LKAS messages on CAN2
@@ -288,7 +387,11 @@ static int gm_fwd_hook(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 
 
 static CAN_FIFOMailBox_TypeDef * gm_pump_hook(void) {
-  volatile int pedal_pressed = (volatile int)brake_pressed_prev && (volatile int)vehicle_moving;
+  volatile int pedal_pressed = (volatile int)gm_gas_prev || ((volatile int)gm_brake_prev && (volatile int)gm_moving);
+  if (gas_interceptor_detected) {
+    pedal_pressed = (volatile int)gm_brake_prev && (volatile int)gm_moving;
+  }
+
   volatile bool current_controls_allowed = (volatile bool)controls_allowed && !(volatile int)pedal_pressed;
 
   if (!gm_ffc_detected) {
