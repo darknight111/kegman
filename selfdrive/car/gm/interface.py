@@ -106,12 +106,13 @@ class CarInterface(CarInterfaceBase):
     elif candidate == CAR.BOLT:
       # initial engage unkown - copied from Volt. Stop and go unknown.
       ret.minEnableSpeed = -1
+      ret.minSteerSpeed = 5 * CV.MPH_TO_MS
       ret.mass = 1616. + STD_CARGO_KG
       ret.safetyModel = car.CarParams.SafetyModel.gm
       ret.wheelbase = 2.60096
       ret.steerRatio = 16.3
       ret.steerRatioRear = 0.
-      ret.centerToFront = ret.wheelbase * 0.4 # wild guess
+      ret.centerToFront = 2.0828
       #PID tunning not to prevent oversteer
       ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[10., 25.0], [10., 25.0]]
       ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.1, 0.13], [0.005, 0.01]]
